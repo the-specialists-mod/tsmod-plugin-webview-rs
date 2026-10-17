@@ -140,6 +140,8 @@ A C ABI, modelled on `plugin-api`:
   | `message_pre(name, data, len) -> Verdict` | the port's `on_message` dispatcher, before any handling | every port HUD user message, for observing and for interception (§7.7) |
   | `command_pre(argc, argv) -> Verdict` | each port-owned client command, before it runs | `slot1`–`slot10`, `invnext`, `invprev`, `buy`, `special`, `impulse`, `+commandmenu`, `togglebrowser`, `cancelselect`, ... |
   | `server_cmd_pre(cmd) -> Verdict` | wherever the port sends a command to the server | `weapon_*` from `hud::weapons::select_slot`, `menuselect`, `cutwire_*`, buy items |
+  | `suspend(reason)` / `resume()` | a server's `block` with `suspend` / disconnect (port client-plugins.md §13.3) | while suspended the port calls nothing else; the webview closes both surfaces and idles the host |
+  | `server_changed(address)` | connect and disconnect | the webview closes the server surface |
   | `shutdown()` | `HUD_Shutdown` | |
 
 * **Functions the port provides** (`ClientExtApi`):
@@ -831,6 +833,10 @@ forward webview_on_state(id, const state[], const reason[]);
 * Registers `register_clcmd("wv", ...)`, reassembles chunks per player, and applies its own
   limits: `webview_max_event_len` (default 2048) and `webview_max_events` (default 8 per 10
   seconds). It kicks with a reason only when `webview_kick_flood 1` is set.
+* **Version matching** is the port's (client-plugins.md §13), not this plugin's. A server pins
+  the webview version with `match` in `plugin_offers.toml` and blocks bad ones with `[[block]]`.
+  This plugin only checks the bridge protocol: a `wv hello` whose `<proto>` it doesn't speak
+  counts as `WV_NONE`, with a log line naming both versions.
 * Sends `hello` on `client_putinserver`, then gives the client 5 seconds before treating it as
   `WV_NONE`. A `policy` follows the `hello` when the cvars `webview_player_caps` and
   `webview_server_caps` (default 31 each) or `webview_set_game_policy` have set anything other
