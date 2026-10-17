@@ -21,18 +21,23 @@ Goals:
   game events (button presses such as `+attack` and `+use`, spawn, death, weapon changes), and
   query local state (own position and view direction, what the crosshair is on, which players
   are in view). See §7.
+* Interception: a page can block, rewrite or hold client events before the game shows or sends
+  them (kill feed, chat, centre and HUD text, menus, MOTD, pickups, weapon selection, buy and
+  other client commands), answer the menus it took over, and hide HUD elements to draw its own.
+  See §7.7–7.9.
 * Player control: the player decides whether servers may open pages at all, and which ones.
 * Shipped and updated on its own release cadence, so Chromium security updates don't need a port
   release.
 
 Non-goals (v1):
 
-* Replacing the port's own VGUI menus (MOTD, buy menu, scoreboard). A later version may offer
-  that through the same interface.
+* Rebuilding the port's VGUI menus inside the plugin. A page can take a menu over (§7.7) and
+  answer it (§7.8), but the port keeps its own menus as the default.
 * Letting a server run arbitrary JavaScript on the client.
-* Letting a page act on the game: it can't run console commands, press buttons or change view
-  angles. It only reads, through the game API (§7.4).
-* Telling a page anything the player can't already see on screen (§7.6).
+* Letting a page act freely on the game: it can't run console commands, press or release
+  buttons, or change view angles. It can only stop or rewrite what the player or server already
+  did, within the limits of §7.10.
+* Telling a page anything the player can't already see on screen (§7.10).
 * IME and non-US keyboard layouts for typing into pages (see §6.3).
 * The software renderer (`ref_soft`): the overlay needs OpenGL and turns itself off without it.
 * macOS.
@@ -129,6 +134,9 @@ A C ABI, modelled on `plugin-api`:
   | `user_message(channel, data, len)` | `TSExt` hook (§4.2) | only messages for channels the extension claimed |
   | `usercmd(cmd)` | `CL_CreateMove`, after the port has built the command | read-only copy: `buttons` (TS bit map, `button_bits`), view angles, `impulse`, `weaponselect` |
   | `game_event(kind, data)` | the port's HUD message handlers | spawn, death, weapon change, health/armour change, team change, map start (§7.3) |
+  | `message_pre(name, data, len) -> Verdict` | the port's `on_message` dispatcher, before any handling | every port HUD user message, for observing and for interception (§7.7) |
+  | `command_pre(argc, argv) -> Verdict` | each port-owned client command, before it runs | `slot1`–`slot10`, `invnext`, `invprev`, `buy`, `special`, `impulse`, `+commandmenu`, `togglebrowser`, `cancelselect`, ... |
+  | `server_cmd_pre(cmd) -> Verdict` | wherever the port sends a command to the server | `weapon_*` from `hud::weapons::select_slot`, `menuselect`, `cutwire_*`, buy items |
   | `shutdown()` | `HUD_Shutdown` | |
 
 * **Functions the port provides** (`ClientExtApi`):
@@ -153,6 +161,23 @@ A C ABI, modelled on `plugin-api`:
 
   GoldSrc has no call to remove a client command, so extensions register commands once and
   dispatch them themselves (§7.2).
+
+* **Interception** (`Verdict`):
+  * `Pass`, `Block`, or `Replace(buf, len)` (for messages, a new payload in the same wire format;
+    for commands, a new command line).
+  * `Defer(token)`, for presentation messages only (§7.7). The port keeps the payload, and the
+    extension later calls `release(token, verdict)` with `Pass`, `Block` or `Replace`. The port
+    then runs its normal display handler on that payload, in arrival order per message.
+  * The port applies a message's state side effects at once and defers or blocks only its
+    display. A blocked or held `DeathMsg` still marks the victim dead on the scoreboard at once;
+    a held `SayText` plays its sound only when released, and a blocked one plays none.
+  * A `Replace` the port's decoder rejects counts as `Block`, with a console warning.
+  * Verdicts are ignored for the messages and commands §7.10 protects.
+* **HUD control:** `hud_set_hidden(mask)` hides port HUD elements (§7.9) and `hud_elements()`
+  lists them with their screen rectangles, so a page can place its own drawing there.
+* **Menu answers:** `menu_reply(kind, choice)` sends the port's own answer to a text or VGUI
+  menu the extension took over (`menuselect N`, `jointeam N`, a buy item), the same command the
+  port's menu would have sent.
 * **Test:** the port gets a stub extension and an `xtask` check on the client roots, as
   `xtask plugins` does for the server.
 
@@ -255,6 +280,9 @@ length-prefixed `postcard` frames (`crates/protocol`), with a protocol version c
   * game API (§7.2–7.4): `CommandRun { surface, name, args, down }`,
     `GameEvents { surface, events }` (one batch per frame), `QueryResult { surface, id, json }`,
     `Grants { surface, caps }`
+  * interception (§7.7–7.9): `Held { surface, token, kind, fields }`,
+    `MenuOpened { surface, token, kind, fields }`, `MenuClosed { token }`,
+    `HudElements { elements }`
   * `Shutdown`
 * **Host → plugin:**
   * `Ready`, `Resized`, `TitleChanged`, `LoadError`
@@ -263,6 +291,9 @@ length-prefixed `postcard` frames (`crates/protocol`), with a protocol version c
   * game API: `RegisterCommand { surface, name, button, help }`, `UnregisterCommand`,
     `Subscribe { surface, kinds }`, `Query { surface, id, what, args }`,
     `Watch { surface, id, what, interval_ms }`, `Unwatch`
+  * interception: `SetRules { surface, rules }` (the whole rule set, replaced each time),
+    `SetHolds { surface, holds }`, `Verdict { surface, token, verdict }`,
+    `MenuReply { surface, token, choice }`, `HudHide { surface, elements }`
 
 ### 6.3 Input
 
@@ -299,9 +330,12 @@ interface TsmodBridge {
   requestCaps(caps: Cap[]): Promise<Cap[]>;               // shows the consent card if needed
   commands: Commands;                     // §7.2, needs "commands"
   game: Game;                             // §7.3 and §7.4, needs "game.read" / "game.input"
+  intercept: Intercept;                   // §7.7, needs "intercept.display" / "intercept.actions"
+  menus: Menus;                           // §7.8, needs "intercept.display"
+  hud: Hud;                               // §7.9, needs "hud"
 }
 
-type Cap = "commands" | "game.read" | "game.input";
+type Cap = "commands" | "game.read" | "game.input" | "intercept.display" | "intercept.actions" | "hud";
 ```
 
 * Event names match `[a-z0-9_.-]{1,31}`. Data is JSON, at most 4 KB after encoding.
@@ -407,34 +441,230 @@ Units are game units; angles are degrees (`angles` is pitch, yaw, roll as the en
 
 ### 7.5 Capabilities and consent
 
-| Surface and origin | `commands` | `game.read` | `game.input` |
-|---|---|---|---|
-| bundled pages (`webview/pages/`) | yes | yes | yes |
-| server surface, server's FastDL origin | yes | yes | yes |
-| server surface, other allowed origin | yes | ask | ask |
-| player surface, origin in `webview_allowlist` | yes | ask | ask |
-| player surface, any other origin | no | no | no |
+| Surface and origin | `commands` | `game.read` | `game.input` | `intercept.display` | `intercept.actions` | `hud` |
+|---|---|---|---|---|---|---|
+| bundled pages (`webview/pages/`) | yes | yes | yes | yes | yes | yes |
+| server surface, server's FastDL origin | yes | yes | yes | yes | yes | yes |
+| server surface, other allowed origin | yes | ask | ask | ask | ask | ask |
+| player surface, origin in `webview_allowlist` | yes | ask | ask | ask | ask | ask |
+| player surface, any other origin | no | no | no | no | no | no |
 
 * "Ask" shows the consent card the first time `requestCaps` asks for it, with the same choices as
-  §8.5. Choices are stored in `webview/consent.json` by origin (and server address, for the
-  server surface).
-* `webview_game_api 0` on the client turns `game.read` and `game.input` off everywhere.
-* The server can turn them off too (§8.1 `policy`), per surface: a competitive server can keep
-  game data away from the player's own pages. The plugin obeys it until the player disconnects.
+  §8.5. The card names each capability in plain words ("hide or change chat and kill messages",
+  "stop weapon switches and menu commands"). Choices are stored in `webview/consent.json` by
+  origin (and server address, for the server surface).
+* `webview_game_api 0` on the client turns `game.read` and `game.input` off everywhere;
+  `webview_intercept 0` turns off `intercept.display`, `intercept.actions` and `hud`.
+* The server can turn any of them off too (§8.1 `policy`), per surface: a competitive server can
+  keep game data and interception away from the player's own pages. The plugin obeys it until
+  the player disconnects.
 * A server-surface page with `game.read` can pass what it learns to the server with `send`. That
   tells the server nothing it doesn't already know.
 
-### 7.6 What the game API never exposes
+### 7.6 Event catalogue
 
-The API is limited to what the player sees on screen, so it can't be used as a wallhack:
+Every client event a page can see or stop, in one table. The kind name is used by `game.on`
+(observe, §7.3), `intercept.rule` and `intercept.hold` (§7.7). Fields are the port's decoded
+message, named in `web/tsmod.d.ts`.
 
-* Players who aren't visible (§7.4) never appear, not even as a count. No query lists other
-  entities, items or projectiles.
-* Positions of other players come only as distance, bearing and screen position, rounded to whole
-  units and degrees.
-* Nothing writes: no view angles, buttons, commands or cvars. A page can still draw over visible
-  players in a `hud` surface, the same as any external overlay; the `policy` switch is there for
-  servers that don't want that.
+Actions: **B** block, **R** rewrite, **H** hold (asynchronous verdict), **T** take over (§7.8),
+**O** observe only.
+
+**From the server** (user messages, through `message_pre`); observing needs `game.read`, acting
+needs `intercept.display`:
+
+| Kind | Messages | Fields | Actions |
+|---|---|---|---|
+| `chat` | `SayText` | `from` (slot, 0 for the server), `team`, `teamOnly`, `text` | B R H |
+| `killfeed` | `DeathMsg` | `killer`, `victim` (slots), `weapon`, plus the TS flags the port decodes | B R H |
+| `textmsg` | `TextMsg` | `dest` (`notify`, `console`, `talk`, `center`), `text`, `args` | B R H |
+| `hudtext` | `HudText`, `TSMessage` | `text` and the message's position and colour fields | B R H |
+| `objective` | `Objective`, `ShowObj` | `text`, `shown` | B R H |
+| `award` | `TSPAward` | `award`, `value` | B H |
+| `pickup` | `WeapPickup`, `AmmoPickup`, `ItemPickup` | `what` (`weapon`, `ammo`, `item`), `id` or `name`, `count` | B |
+| `menu` | `ShowMenu` (text menus) | `keys` (valid choices), `time`, `text` | B R H T |
+| `vguimenu` | `VGUIMenu` | `menu` (team select, class, buy, MOTD, ... by the port's menu ids) | B T |
+| `motd` | `MOTD` | `text` (or the URL, when the text is one) | B T |
+| `state` | `Health`, `Battery`, `TSHealth`, `TSArmor`, `CurWeapon`, `WeaponList`, `AmmoX`, `ClipInfo`, `WStatus`, `ScoreInfo`, `TeamInfo`, `TeamScore`, `TSState`, `TSCash`, `KFuPower`, `PwUp`, `PwUpTime`, `RoundTime`, `NextStunt`, `TSSpace`, `ActItems`, `TSFlag`, `Spectator`, `SetFOV`, `HideWeapon`, `Wires`, `ResetHUD`, `InitHUD`, `ServerName`, `GameTitle`, `TeamNames` | `message` and its decoded fields | O |
+| `effect` | `ScreenFade`, `ScreenShake`, `TSFade`, `TSMBlur`, `Damage`, `PTakeDam`, `Geiger`, `TSBTime`, `TSSlowMo` | `message` and its decoded fields | O |
+
+**From the player** (client actions, through `command_pre` and `server_cmd_pre`); observing needs
+`game.input`, acting needs `intercept.actions`:
+
+| Kind | Source | Fields | Actions |
+|---|---|---|---|
+| `weapon_select` | `slot1`–`slot10`, `invnext`, `invprev`, and the `weapon_*` command they produce | `slot`, `weapon` (name), `command` | B |
+| `menu_select` | `menuselect N` from the port's text menu, VGUI menu answers | `menu`, `choice` | B |
+| `buy` | `buy` and the buy menu's purchase commands | `item` | B |
+| `command` | the other port client commands: `special`, `impulse`, `+commandmenu`, `togglebrowser`, `cancelselect`, `specmode`, `thirdperson`, `firstperson` | `name`, `args` | B |
+| `chat_send` | `say`, `say_team` (open question 9) | `text`, `teamOnly` | B H, and R on the player surface only |
+| `input` | button edges (§7.3) | `button`, `down` | O |
+
+* **Not in the table, not reachable:** engine-only traffic (`svc_print`, kick and disconnect
+  reasons, `svc_stufftext`, voice), `SrvSett`, `TSExt` itself, and every message the port doesn't
+  hook. A message added to the port later is `O` until this table lists it.
+* **Wire to catalogue:** the plugin keeps one decoder per message, the same layout as the port's
+  `shared::protocol::hud` types, and checks it against the port's message table at `init`. A
+  message whose size or registration doesn't match is passed through untouched and reported by
+  `webview_status`.
+
+### 7.7 Interception
+
+The page runs in another process, at least a frame away, but a verdict is needed inside the game
+callback. So there are two ways to intercept:
+
+* **Rules** are declarative and evaluated synchronously in the plugin, with no page round trip.
+  Every kind with B or R takes rules.
+* **Holds** send the event to the page and wait for its verdict, up to a timeout. Only kinds with
+  H take holds: presentation, where a short delay is harmless. Weapon selection, menu answers,
+  buying and commands are rules only, because a delay there is felt.
+
+```ts
+interface Intercept {
+  rule(r: Rule): string;                  // returns a rule id
+  hold(kind: HoldKind, handler: (e: CatalogueEvent) => Verdict | Promise<Verdict>,
+       opts?: { match?: Match; timeoutMs?: number }): string;
+  remove(id: string): void;
+  clear(): void;
+  list(): (Rule | HoldInfo)[];
+}
+
+type Rule = {
+  kind: InterceptKind;
+  match?: Match;                          // all entries must match
+  action: "block" | { rewrite: Rewrite } | "takeover";
+  once?: boolean;                         // removed after its first match
+  ttlMs?: number;                         // removed after this long
+};
+
+// Per field: exact value, or { contains }, { prefix }, { in: [...] }, { not: ... }.
+// Slot fields also take "self", "teammate", "enemy".
+type Match = Record<string, Value | { contains: string } | { prefix: string } | { in: Value[] } | { not: Value }>;
+
+// Only text fields: chat/textmsg/hudtext/objective `text` and `args`, killfeed `weapon`,
+// menu `text`. Slot fields (who said or did it) can't be rewritten.
+type Rewrite = Record<string, string>;
+
+type Verdict = "pass" | "block" | "takeover" | { rewrite: Rewrite };
+```
+
+* **Order:** for each event the plugin first checks the protected list (§7.10). Then it runs the
+  server surface's rules, then the player surface's, in the order they were added. Then it runs
+  the holds, server surface first. The first `block` or `takeover` ends the run; rewrites
+  accumulate, and each later rule sees the rewritten fields.
+* **Rewrites:** the plugin re-encodes the message with the port's encoder and hands it to the
+  port as `Replace`. Text is limited to what the message carries (chat to 190 bytes). The port's
+  colour codes are kept; other control bytes are stripped.
+* **Holds:**
+  * `timeoutMs` is 100 by default and at most 500. The total for one event, over all holds, is
+    capped at 500 ms.
+  * **Fail open:** on timeout, an exception in the handler, a crash, a navigation or a closed
+    surface, the event passes unchanged. The plugin logs the timeout once per hold.
+  * **Order:** a held event of a kind holds back later events of that kind, so chat and the kill
+    feed never show out of order. At most 32 can queue per kind; past that, the oldest passes.
+  * A hidden surface's holds still run.
+* **Lifetime:** rules and holds belong to the page that added them. They're removed when it
+  navigates, reloads, closes or crashes, when the host restarts, and, for the server surface,
+  on disconnect.
+* **Limits:** 64 rules and 16 holds per surface; strings in a match at most 64 bytes.
+* **Seeing it happen:**
+  * `webview_intercepts` lists the active rules and holds and their owners.
+  * `webview_intercept_reset` removes them all.
+  * `webview_intercept_log 1` prints each block, rewrite and takeover.
+  * While anything is intercepting, the plugin draws a small marker in a screen corner
+    (`webview_intercept_indicator`, default 1).
+
+Examples:
+
+```ts
+// Hide join/leave notices and restyle the kill feed on the page instead.
+tsmod.intercept.rule({ kind: "textmsg", match: { text: { contains: "#Game_joined" } }, action: "block" });
+tsmod.intercept.rule({ kind: "killfeed", action: "block" });
+tsmod.game.on("killfeed", e => feed.push(e));          // observed events still arrive when blocked
+
+// A chat filter that can look things up before deciding.
+tsmod.intercept.hold("chat", async e => (await isSpam(e.text)) ? "block" : "pass", { timeoutMs: 150 });
+
+// No weapon switching while the shop panel is open.
+const r = tsmod.intercept.rule({ kind: "weapon_select", action: "block" });
+shop.onClose(() => tsmod.intercept.remove(r));
+```
+
+### 7.8 Taking over menus
+
+A `takeover` verdict on a `menu`, `vguimenu` or `motd` event stops the port's menu. The page then
+gets the menu as a handle it can answer:
+
+```ts
+interface Menus {
+  on(cb: (m: MenuHandle) => void): void;  // fires for each menu this page took over
+}
+interface MenuHandle {
+  kind: "menu" | "vguimenu" | "motd";
+  fields: CatalogueEvent;                 // keys, text, menu id, MOTD text
+  reply(choice: number | string): void;   // a key from `keys`, a team, a buy item
+  cancel(): void;                         // as Esc on the port's menu
+  closed: Promise<void>;                  // the server closed it, it timed out, or it was answered
+}
+```
+
+* `reply` goes through `menu_reply` (§4.1), so the server gets exactly the command the port's
+  own menu would have sent. A choice the menu doesn't offer (a key not in `keys`, a team the
+  team menu doesn't list) is refused.
+* A handle answers once. It expires with the menu's `time`, when a newer menu replaces it, or on
+  `ResetHUD`.
+* **Fail open:** if the page closes or crashes while it holds an open menu, the port shows its
+  own menu again.
+* For a URL MOTD, `takeover` and then `tsmod.show()` lets the page display it. This covers open
+  question 4 without a port hook.
+
+### 7.9 HUD control
+
+```ts
+interface Hud {
+  elements(): Promise<{ name: HudElement; rect: [number, number, number, number]; visible: boolean }[]>;
+  hide(names: HudElement[]): void;
+  show(names: HudElement[]): void;
+}
+
+type HudElement =
+  | "health" | "armour" | "ammo" | "weapon_select" | "crosshair" | "killfeed" | "chat"
+  | "notify" | "centre" | "hudtext" | "timer" | "cash" | "kungfu" | "stunt" | "powerup"
+  | "objective" | "pickups" | "status_icons" | "spectator" | "scoreboard";
+```
+
+* This goes through `hud_set_hidden` (§4.1). It only stops drawing: the port keeps the element's
+  state, so `show` brings it back as it would be now.
+* `elements()` gives each element's rectangle in screen pixels, so a `hud` surface can draw its
+  own version in the same place.
+* Hidden elements come back when the page that hid them navigates, closes or crashes, and with
+  `webview_hud_reset`.
+
+### 7.10 What pages can never see or do
+
+The API is limited to what the player sees on screen and to undoing what already happened. So it
+can't be used as a wallhack, an aimbot or a triggerbot, and it can't speak for the player:
+
+* **Seeing:**
+  * Players who aren't visible (§7.4) never appear, not even as a count. No query lists other
+    entities, items or projectiles.
+  * Positions of other players come only as distance, bearing and screen position, rounded to
+    whole units and degrees.
+* **Writing:** no view angles, buttons, console commands or cvars. The only commands a page
+  causes are menu answers within what the menu offers (§7.8), and chat the player typed and the
+  page rewrote (player surface only).
+* **Protected events** take no rules or holds, whatever the page asks:
+  * `state` messages, which keep the HUD and prediction in step with the server;
+  * `effect` messages, so a page can't remove fades, shakes, blur, damage indicators or slow
+    motion meant to hinder the player;
+  * `input` buttons: blocking `+attack` until the crosshair is on an enemy would be a
+    triggerbot;
+  * `webview_*` commands, Esc, the console key and the toggle key;
+  * everything outside the catalogue (§7.6).
+* **No forgery:** slot fields can't be rewritten, so a page can't make a line look as if another
+  player said or did it. Nor can it add events to the port's HUD; it can only draw its own.
+* A page can still draw over visible players in a `hud` surface, the same as any external
+  overlay. The `policy` switch is there for servers that don't want that.
 
 ## 8. Server ⇄ client protocol
 
@@ -461,7 +691,7 @@ The client reassembles the chunks for each `msg_id` and gives up after 2 seconds
 | 5 | `close` | none |
 | 6 | `event` | `name\0json` |
 | 7 | `hello` | none; the client answers with `wv hello` (§8.2) |
-| 8 | `policy` | one byte of flags: 1 `game.read` on the player surface, 2 `game.input` on the player surface, 4 `game.read` on the server surface, 8 `game.input` on the server surface. Default before any `policy`: 15 |
+| 8 | `policy` | two bytes of flags, little-endian: 1 `game.read`, 2 `game.input`, 4 `intercept.display`, 8 `intercept.actions`, 16 `hud` on the player surface; the same shifted left by 8 (256, 512, 1024, 2048, 4096) on the server surface. A cleared bit removes the capability whatever consent says. Default before any `policy`: everything (`0x1F1F`) |
 
 ### 8.2 Client → server: client command `wv`
 
@@ -507,6 +737,9 @@ other stuffed commands. That is why it is opt-in.
 | `webview_preload` | 0 | start the host at launch |
 | `webview_idle_exit` | 300 | seconds with nothing visible before the host exits; 0 never |
 | `webview_game_api` | 1 | 0 turns the game API's `game.read` and `game.input` off for every page (§7.5) |
+| `webview_intercept` | 1 | 0 turns `intercept.display`, `intercept.actions` and `hud` off for every page |
+| `webview_intercept_indicator` | 1 | draw the marker while anything intercepts (§7.7) |
+| `webview_intercept_log` | 0 | print each block, rewrite and takeover |
 
 Origin rules for server `open` and `navigate`:
 
@@ -528,6 +761,8 @@ Origin rules for server `open` and `navigate`:
 * `webview_status`: prints the host state, surfaces and protocol version.
 * `webview_consent_reset`: clears stored consent choices.
 * `webview_commands`: lists the `wv_*` commands pages registered, their owners and help (§7.2).
+* `webview_intercepts`, `webview_intercept_reset`: list or remove every rule and hold (§7.7).
+* `webview_hud_reset`: shows every HUD element pages hid (§7.9).
 * `wv_*`: commands registered by pages.
 
 ## 9. AMX Mod X plugin (`amxx/`)
@@ -560,13 +795,15 @@ native webview_hide(id);
 native webview_close(id);
 native webview_send(id, const event[], const json[]);   // json ≤ 2 KB
 
-// Game API policy (§7.5, `policy` op). WV_GAME_* flags; id = 0 sets it for everyone,
+// Game API and interception policy (§7.5, `policy` op). id = 0 sets it for everyone,
 // including players who join later.
-#define WV_GAME_PLAYER_READ  1
-#define WV_GAME_PLAYER_INPUT 2
-#define WV_GAME_SERVER_READ  4
-#define WV_GAME_SERVER_INPUT 8
-native webview_set_game_policy(id, flags);
+#define WV_CAP_READ      1    // game.read
+#define WV_CAP_INPUT     2    // game.input
+#define WV_CAP_DISPLAY   4    // intercept.display
+#define WV_CAP_ACTIONS   8    // intercept.actions
+#define WV_CAP_HUD       16   // hud
+#define WV_CAP_ALL       31
+native webview_set_game_policy(id, player_caps = WV_CAP_ALL, server_caps = WV_CAP_ALL);
 
 // Fired for each reassembled `wv ev` from a client (already length/rate-checked).
 forward webview_on_event(id, const event[], const json[]);
@@ -585,9 +822,10 @@ forward webview_on_state(id, const state[], const reason[]);
   limits: `webview_max_event_len` (default 2048) and `webview_max_events` (default 8 per 10
   seconds). It kicks with a reason only when `webview_kick_flood 1` is set.
 * Sends `hello` on `client_putinserver`, then gives the client 5 seconds before treating it as
-  `WV_NONE`. A `policy` follows the `hello` when the cvar `webview_game_policy` (default 15) or
-  `webview_set_game_policy` has set anything other than 15.
-* Page commands and game events stay on the client. The server sees only what a server page
+  `WV_NONE`. A `policy` follows the `hello` when the cvars `webview_player_caps` and
+  `webview_server_caps` (default 31 each) or `webview_set_game_policy` have set anything other
+  than everything. A competitive config sets `webview_player_caps 0`.
+* Page commands, game events and interception stay on the client. The server sees only what a server page
   chooses to `send`.
 
 ### 9.3 Admin commands
@@ -609,14 +847,18 @@ plugins' `server_cmd` can drive the overlay. Targets follow AMXX's `cmd_target`:
 * `say /stats` opens `<sv_downloadurl>/webview/stats.html` as a panel and sends
   `stats.update` events with the player's kills and deaths every 5 seconds while it is open.
 * `say /vote` opens a vote page, and the plugin tallies the `vote.cast` events it receives.
-
 * `say /hud` opens `<sv_downloadurl>/webview/hud.html` as a `hud` surface. The page uses the game
   API: a hit counter on `input` `attack`, the aimed-at player's name from the `aim` event, a
   "players in view" count from `watch("players", 250)`, and `wv_hud` (`+wv_hud` held shows the
-  full panel).
+  full panel). It also hides the port's `health`, `armour` and `ammo` elements and draws its
+  own in their rectangles, and blocks the `killfeed` to show a restyled one fed by observed
+  `killfeed` events.
+* `say /menu` sends a stock `ShowMenu` text menu; the open `hud.html` page takes it over, shows
+  it as clickable buttons and answers it with `reply`. The plugin prints the `menuselect` it
+  receives, which is the same as the port's own menu would have sent.
 
-This shows both directions, the game API and the FastDL hosting that needs no consent. The pages live in
-`web/demo/` and the server's FastDL tree.
+This shows both directions, the game API, interception and the FastDL hosting that needs no
+consent. The pages live in `web/demo/` and the server's FastDL tree.
 
 ## 10. Build, test, release
 
@@ -626,6 +868,9 @@ This shows both directions, the game API and the FastDL hosting that needs no co
   bytes, the escaping rules, the origin policy table and key mapping. Also covers the game API's
   pure parts: command name rules and the ownership table, button-edge detection from `buttons`
   words, the capability table (§7.5) and the visibility filter (§7.4) on recorded snapshots.
+  For interception: rule matching, the evaluation order and rewrite chaining, the protected list,
+  hold timeouts failing open, per-kind ordering behind a held event, and a decode/re-encode round
+  trip for every catalogue message against payloads recorded from the port.
 * **`cargo xtask e2e [roots]`:**
   1. *Client:* on the port's FWGS root (Xvfb, as the port's screenshot runs do), with a
      cfg-driven run. It loads the plugin, runs `webview_open` with a bundled test page that
@@ -636,10 +881,19 @@ This shows both directions, the game API and the FastDL hosting that needs no co
      `+attack` / `-attack` and `+use` / `-use`, and the page paints one colour per event it saw.
      The page also runs `self` and `aim` queries on a known map spot and logs the results to the
      console, which the run checks.
+
+     A third page blocks `slot2` (`weapon_select`) and hides `health`; the cfg runs `slot2` and
+     the run checks the weapon didn't change and the screenshot has no health digits.
   2. *Server and client:* the AMXX test roots (`amxx_rehlds_linux` and `amxx_rehlds_win`) plus an
      FWGS client. `webview_e2e.sma` opens a page on the client; the page answers `e2e.ping` with
      `e2e.pong`, which the plugin logs. The run also checks the fallback refusal and the flood
      limit.
+
+     For interception, the plugin sends `SayText`, `DeathMsg`, `TextMsg` and a `ShowMenu`. The
+     page blocks one chat line, rewrites another, holds the kill feed past its timeout (which
+     must fail open), and takes over the menu and answers key 2; the run checks the client
+     console and the `menuselect 2` the server receives. With `webview_player_caps 0` and
+     `webview_server_caps 0`, the same page must get `cap` errors and change nothing.
   3. *Steam HL25:* manual for v1, following the port's `docs/validation.md` §5 (Steam status
      invisible while testing).
 * **Releases:** a `v*` tag runs `release.yml`. It publishes:
@@ -673,6 +927,8 @@ ts/webview/profile/                       created at run time
 | Server → page event latency | one server frame plus one page frame |
 | Game event latency (`input`, `aim`) | one client frame plus one page frame |
 | Game API cost in the game | ≤ 0.2 ms per frame with `players` watched on a 32-player server; 0 when nothing subscribes or watches |
+| Rule evaluation | ≤ 5 µs per event with 64 rules; nothing when no rule or hold names the kind |
+| Held event delay | the page's answer time, at most the hold's `timeoutMs` (100 ms by default, 500 ms in total) |
 
 ## 12. Open questions
 
@@ -681,8 +937,9 @@ ts/webview/profile/                       created at run time
 2. Does FWGS's GLES renderer give a usable `glTexSubImage2D` with BGRA (`GL_EXT_texture_format_BGRA8888`),
    or does the plugin need to swizzle?
 3. Clipboard paste in a windowless CEF on Linux without an X11/Wayland window of its own.
-4. Should the port's MOTD (`VGUIMenu` 5) be able to hand an `http(s)://` MOTD to the overlay when
-   the plugin is installed? This needs a port hook; the proposal is v2.
+4. URL MOTDs: §7.8's `motd` takeover lets a page show one. Should the plugin also offer a
+   built-in "open URL MOTDs in the overlay" setting, without a page, subject to §8.5's origin
+   rules?
 5. Windows i686 host for 32-bit Windows systems: drop it, or ship CEF's win32 build?
 6. Does FWGS offer a way to remove a client command (`pfnDelCommand` or similar)? If so, the port's
    `client-ext-api` could expose it on FWGS and §7.2 could drop its no-owner stubs there.
@@ -691,17 +948,34 @@ ts/webview/profile/                       created at run time
    `hud` page highlighting visible enemies argues for off on competitive servers.
 8. `death.killer` and `weapon` names: take them from the port's `DeathMsg` handling as the kill
    feed shows them, or from `weapon_name(id)`? They must match what the HUD prints.
+9. Outgoing chat: `say` and `say_team` aren't port commands. The engine forwards them, and
+   `messagemode` is the engine's own. Can the port register `say`/`say_team` in `client.dll` and
+   forward them itself (`ServerCmd`) on both HL25 and FWGS, without the engine rejecting the name
+   or changing behaviour? If not, `chat_send` is dropped from v1.
+10. The port's handlers mix state and display for some messages (`DeathMsg` updates the
+    scoreboard and the kill feed; `TextMsg` checks `AllowedToPrintText`). §4.1 needs them split
+    so a block or hold only touches the display. Which handlers need splitting is a port-side
+    audit, done in milestone 1.
+11. TS's buy menu commands: which commands does the port's buy VGUI send, so `buy` and
+    `menu_reply` can name them exactly?
+12. Should a server surface be able to block the player's own pages' interception (it can, with
+    `policy`), and should the player be told when a server has done so? The proposal is a line in
+    `webview_status` and the consent card.
 
 ## 13. Milestones
 
 1. **Port:** client extension API with a stub extension and an xtask check, including the
-   `usercmd` and `game_event` callbacks and the read-only game state functions; the `TSExt`
-   message. Two port issues.
+   `usercmd` and `game_event` callbacks, the read-only game state functions, and the
+   interception hooks (`message_pre`, `command_pre`, `server_cmd_pre`, `Defer`/`release`,
+   `hud_set_hidden`, `menu_reply`) with the state/display split; the `TSExt` message. Two port
+   issues; the interception hooks may be a third.
 2. **Player overlay:** the host with CEF, shared memory and the pipe; the plugin with drawing,
    input and `webview_toggle`, on FWGS Linux first, then Windows, Wine and Steam HL25.
 3. **Server control:** `TSExt` handling, the policy and consent card, `_wv` discovery, the bridge.
 4. **Game API:** page commands, game events, queries, capabilities and the `policy` op; the
    e2e test pages.
-5. **AMXX:** `tsmod_webview.sma` and `.inc`, admin commands, the demo plugin, e2e on the AMXX
+5. **Interception:** the catalogue decoders, rules, holds, menu takeover, HUD control, the
+   marker and the console commands; the e2e pages.
+6. **AMXX:** `tsmod_webview.sma` and `.inc`, admin commands, the demo plugin, e2e on the AMXX
    roots.
-6. **Release:** release workflow, CEF bump automation, launcher integration.
+7. **Release:** release workflow, CEF bump automation, launcher integration.
