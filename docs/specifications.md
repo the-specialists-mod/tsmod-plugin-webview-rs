@@ -114,9 +114,12 @@ time). Two additions go in the port, filed as port issues before work starts her
 
 A C ABI, modelled on `plugin-api`:
 
-* **Loading:** at `Initialize`, `client.dll/.so` loads every `cl_dlls/tsmod_<name><suffix>`
-  library, where the suffix is the client library's platform suffix. It calls the exported
-  `TSRS_ClientExtLoad(api, ext)` once. The size and version checks are exact, the same as
+* **Loading:** `client.dll/.so` loads only plugins the player has approved, from installed
+  packages (`cl_plugins/<id>/<version>/`) or hand-installed `cl_dlls/tsmod_<name><suffix>`
+  libraries. Every file of an approved plugin is hashed at each start, and a plugin with any
+  changed, missing or extra file doesn't load until the player approves it again. That's the
+  port's spec `docs/implementation/client-plugins.md`, which also covers packages servers
+  offer. The loader calls the exported `TSRS_ClientExtLoad(api, ext)` once. The size and version checks are exact, the same as
   `plugin-api`: a library built for another version is skipped with a console warning.
 * **Engine-thread rule:** the extension is called only on the engine thread, from inside a client
   export.
@@ -147,6 +150,9 @@ A C ABI, modelled on `plugin-api`:
   * `gl_proc(name)` (the port's `goldsrc::ext::gl` loader), `renderer_kind` (GL, GLES or
     software)
   * `claim_channel(name)`, `server_address`, `game_dir`, `port_version`
+  * `data_dir()` (`cl_plugins_data/<id>/`, the only place a plugin writes) and
+    `verified_spawn(path, args)`, which re-hashes an executable against the approval just before
+    starting it (client-plugins.md §5.2)
   * read-only game state, for the game API (§7.4). Each returns a plain `#[repr(C)]` copy, not
     an engine pointer:
     * `local_state()`: alive, team, health, armour, eye origin, view angles, velocity, on
@@ -191,8 +197,10 @@ generic message for extensions:
   user message is 192 bytes.
 
 The port client hooks `TSExt` and passes each message to the extension that claimed the channel.
-Messages for an unclaimed channel are dropped silently, so servers can send them to vanilla port
-clients safely. This repo uses the channel `webview`.
+Messages for an unclaimed channel are dropped silently, so servers can send them to any port
+client safely. TS 3.0's own client doesn't hook `TSExt` and can fail on it, so the port server
+sends `TSExt` only to clients with the `_tsrs` userinfo (client-plugins.md §12), and refuses an
+AMXX `message_begin` for others. This repo uses the channel `webview`.
 
 The port server also announces the API in the server's `SrvSett` so plugins can check support.
 
@@ -226,7 +234,9 @@ The port server also announces the API in the server's `SrvSett` so plugins can 
   * Exits when the pipe closes or the parent PID dies. On Linux it also uses
     `PR_SET_PDEATHSIG`; on Windows, a job object.
 * **Profile:**
-  * Cache and cookies live in `<game dir>/webview/profile/`, kept apart from any system browser.
+  * Cache and cookies live in the plugin's data directory, `cl_plugins_data/webview/profile/`,
+    kept apart from any system browser and outside the package, so they don't change the
+    approved hashes.
   * Persistence is controlled by `webview_persist` (default 1).
 * **Locked down:** downloads, popups and new windows (`OnBeforePopup` cancels), `file://`
   outside `web/` and the bundled pages, and `localhost`/private addresses unless
@@ -443,7 +453,7 @@ Units are game units; angles are degrees (`angles` is pitch, yaw, roll as the en
 
 | Surface and origin | `commands` | `game.read` | `game.input` | `intercept.display` | `intercept.actions` | `hud` |
 |---|---|---|---|---|---|---|
-| bundled pages (`webview/pages/`) | yes | yes | yes | yes | yes | yes |
+| bundled pages (`pages/` in the package) | yes | yes | yes | yes | yes | yes |
 | server surface, server's FastDL origin | yes | yes | yes | yes | yes | yes |
 | server surface, other allowed origin | yes | ask | ask | ask | ask | ask |
 | player surface, origin in `webview_allowlist` | yes | ask | ask | ask | ask | ask |
@@ -451,7 +461,7 @@ Units are game units; angles are degrees (`angles` is pitch, yaw, roll as the en
 
 * "Ask" shows the consent card the first time `requestCaps` asks for it, with the same choices as
   §8.5. The card names each capability in plain words ("hide or change chat and kill messages",
-  "stop weapon switches and menu commands"). Choices are stored in `webview/consent.json` by
+  "stop weapon switches and menu commands"). Choices are stored in `cl_plugins_data/webview/consent.json` by
   origin (and server address, for the server surface).
 * `webview_game_api 0` on the client turns `game.read` and `game.input` off everywhere;
   `webview_intercept 0` turns off `intercept.display`, `intercept.actions` and `hud`.
@@ -747,7 +757,7 @@ Origin rules for server `open` and `navigate`:
   trusts for content), plus origins in `webview_allowlist`.
 * Allowed only after consent: any other `https://` origin. The consent card shows the origin and
   three choices: Allow once, Always for this server, Deny. Choices are stored in
-  `webview/consent.json`, keyed by server address and origin.
+  `cl_plugins_data/webview/consent.json`, keyed by server address and origin.
 * Never allowed: `http://` (unless `webview_allow_local`), `file:`, `data:`, `javascript:`,
   `chrome:`, `devtools:` and anything else.
 * Navigation inside the page that leaves allowed origins closes the server surface.
@@ -897,23 +907,32 @@ consent. The pages live in `web/demo/` and the server's FastDL tree.
   3. *Steam HL25:* manual for v1, following the port's `docs/validation.md` §5 (Steam status
      invisible while testing).
 * **Releases:** a `v*` tag runs `release.yml`. It publishes:
-  * `tsmod-webview-<tag>-<platform>.{zip,tar.gz}`: the client plugin, host, CEF and the bundled
-    pages.
+  * `webview-<version>.tspkg`: one signed package for all four platforms (client-plugins.md §3),
+    with the client plugin, the host, CEF and the bundled pages. The release key signs the
+    manifest, and the-specialists-mod's countersignature makes it "Verified". Its
+    `.manifest.toml` and `.manifest.sig` are published next to it, and `xtask plugin-offer`'s
+    entry for `plugin_offers.toml` goes in the release notes.
+  * `tsmod-webview-<tag>-<platform>.{zip,tar.gz}`: the same files unpacked, for manual installs.
+    They still go through the start-up approval.
   * `tsmod-webview-amxx-<tag>.zip`: `.amxx`, `.sma` and `.inc`.
 * **Version pinning:** the crate pins the port's `client-ext-api` by tag, the same way
   tsmod-amxx-rs pins `plugin-api`. A release states the port versions it works with. The launcher
-  offers the client archive as an optional download, as it does the HD pack.
+  offers the package as an optional download, as it does the HD pack, and approves it through its
+  own dialog. Servers can offer it with `plugin_offers.toml`; the demo plugin's README shows how.
 * **Chromium updates:** a scheduled workflow checks for a new CEF stable build weekly and opens a
   PR with the bump.
 
 ### Install layout (client)
 
 ```
-ts/cl_dlls/tsmod_webview<suffix>          client plugin
-ts/webview/bin/tsmod-webview-host[.exe]   helper + CEF (libcef, paks, locales, icudtl.dat, ...)
-ts/webview/pages/                         bundled pages (start page, consent card, test page)
-ts/webview/profile/                       created at run time
+ts/cl_plugins/webview/<version>/manifest.toml, manifest.sig
+ts/cl_plugins/webview/<version>/lib/<platform>/tsmod_webview<suffix>   client plugin
+ts/cl_plugins/webview/<version>/bin/tsmod-webview-host[.exe]          helper + CEF (libcef, paks, locales, icudtl.dat, ...)
+ts/cl_plugins/webview/<version>/pages/                                bundled pages (start page, consent card, test page)
+ts/cl_plugins_data/webview/                                           profile, consent.json; created at run time
 ```
+
+The host and CEF start through `verified_spawn`. CEF's subprocesses are the same executable.
 
 ## 11. Budgets
 
@@ -964,7 +983,8 @@ ts/webview/profile/                       created at run time
 
 ## 13. Milestones
 
-1. **Port:** client extension API with a stub extension and an xtask check, including the
+1. **Port:** client plugin packages and approval (port spec `client-plugins.md`, its own
+   milestones); client extension API with a stub extension and an xtask check, including the
    `usercmd` and `game_event` callbacks, the read-only game state functions, and the
    interception hooks (`message_pre`, `command_pre`, `server_cmd_pre`, `Defer`/`release`,
    `hud_set_hidden`, `menu_reply`) with the state/display split; the `TSExt` message. Two port
